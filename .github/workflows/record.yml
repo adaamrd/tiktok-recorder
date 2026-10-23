@@ -3,6 +3,8 @@ name: TikTok Smart Recorder
 on:
   push:
     branches: [ main ]
+  schedule:
+    - cron: '5 */5 * * *'
   workflow_dispatch:
     inputs:
       username:
@@ -23,6 +25,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   record:
@@ -35,21 +38,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install System Dependencies
+      - name: Check & Setup Tools Fast
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg python3-pip git curl
+          command -v ffmpeg >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y ffmpeg)
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Setup Recorder & Chat Tools
-        run: |
           git clone https://github.com/Michele0303/tiktok-live-recorder.git
           cd tiktok-live-recorder
-          uv venv --python 3.11
-          uv sync
-          uv pip install TikTokLive yt-dlp
+          ~/.local/bin/uv venv --python 3.11
+          ~/.local/bin/uv sync
+          ~/.local/bin/uv pip install TikTokLive yt-dlp
 
       - name: Prepare UI Builder Script
         run: |
@@ -482,7 +481,7 @@ jobs:
                   f.write(out)
           PYEOF
 
-      - name: Run Smart Monitor (Video + Real Viewers + Supporters + Player)
+      - name: Run 24/7 Non-Stop Smart Monitor
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -510,16 +509,29 @@ jobs:
           def ensure_release():
               subprocess.run([
                   "gh", "release", "create", TAG,
-                  "--title", f"تسجيل بث ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+                  "--title", f"Archive ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
                   "--notes", "الفيديو الخام + مشغل TikTok_Player.html التفاعلي + ملف التعليقات (.ass / .srt)"
               ], check=False)
+
+          def stealth_rename(filepath):
+              dirname, basename = os.path.split(filepath)
+              if USER and USER in basename:
+                  basename = basename.replace(f"TK_{USER}_", "stream_").replace(USER, "stream")
+              new_path = os.path.join(dirname, basename)
+              if new_path != filepath and os.path.exists(filepath):
+                  os.rename(filepath, new_path)
+              return new_path
 
           def upload_bundle(mp4_path):
               if not os.path.exists(mp4_path) or os.path.getsize(mp4_path) == 0:
                   return
+              srt_orig = mp4_path.replace(".mp4", ".srt")
+              json_orig = mp4_path.replace(".mp4", ".json")
+              mp4_path = stealth_rename(mp4_path)
+              srt_path = stealth_rename(srt_orig) if os.path.exists(srt_orig) else mp4_path.replace(".mp4", ".srt")
+              json_path = stealth_rename(json_orig) if os.path.exists(json_orig) else mp4_path.replace(".mp4", ".json")
+
               ensure_release()
-              srt_path = mp4_path.replace(".mp4", ".srt")
-              json_path = mp4_path.replace(".mp4", ".json")
               events = []
               if os.path.exists(json_path):
                   try:
@@ -633,7 +645,7 @@ jobs:
           start_chat_thread()
 
           cmd = [
-              "uv", "run", "python", "src/main.py",
+              os.path.expanduser("~/.local/bin/uv"), "run", "python", "src/main.py",
               "-user", USER,
               "-mode", "automatic",
               "-automatic_interval", "1",
@@ -654,7 +666,7 @@ jobs:
 
               if not flvs and (ytdlp_proc is None or ytdlp_proc.poll() is not None) and (time.time() - start_global > 35):
                   ts = datetime.now().strftime("%Y.%m.%d_%H-%M-%S")
-                  yt_out = os.path.join(OUT_DIR, f"ytdlp_{USER}_{ts}_raw.mp4")
+                  yt_out = os.path.join(OUT_DIR, f"ytdlp_stream_{ts}_raw.mp4")
                   target = LIVE_URL if LIVE_URL else f"https://www.tiktok.com/@{USER}/live"
                   ytdlp_proc = subprocess.Popen([
                       "./tiktok-live-recorder/.venv/bin/yt-dlp",
@@ -689,64 +701,64 @@ jobs:
           EOF
           PYTHONPATH=. ./tiktok-live-recorder/.venv/bin/python manager.py
 
-      - name: Finalize & Save Stream + TikTok Player (Even if Stopped Early)
+      - name: Finalize Stream & Auto-Trigger Next 5-Hour Session (24/7 Loop)
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          TARGET_USER: ${{ inputs.username || 'da3bolgaming' }}
         run: |
           python3 - << 'EOF'
           import os, glob, time, json, subprocess
           from datetime import datetime
           from ui_builder import parse_srt, write_ass, build_html
 
+          USER = os.environ.get("TARGET_USER", "da3bolgaming").strip().lstrip("@")
           REPO = os.environ.get("REPO", "adaamrd/tiktok-recorder")
           OUT_DIR = os.path.abspath("recordings")
-          if not os.path.exists(OUT_DIR):
-              raise SystemExit(0)
 
-          TAG = f"stream-{int(time.time())}"
-          if os.path.exists("release_tag.txt"):
-              with open("release_tag.txt") as tf:
-                  TAG = tf.read().strip() or TAG
+          if os.path.exists(OUT_DIR):
+              TAG = f"stream-{int(time.time())}"
+              if os.path.exists("release_tag.txt"):
+                  with open("release_tag.txt") as tf:
+                      TAG = tf.read().strip() or TAG
 
-          for raw in glob.glob(os.path.join(OUT_DIR, "*_flv.mp4")) + glob.glob(os.path.join(OUT_DIR, "*_raw.mp4")):
-              final_mp4 = raw.replace("_flv.mp4", ".mp4").replace("_raw.mp4", ".mp4")
-              if not os.path.exists(final_mp4) and os.path.getsize(raw) > 0:
-                  subprocess.run(["ffmpeg", "-y", "-i", raw, "-c", "copy", final_mp4], check=False)
+              for raw in glob.glob(os.path.join(OUT_DIR, "*_flv.mp4")) + glob.glob(os.path.join(OUT_DIR, "*_raw.mp4")):
+                  final_mp4 = raw.replace("_flv.mp4", ".mp4").replace("_raw.mp4", ".mp4")
+                  if not os.path.exists(final_mp4) and os.path.getsize(raw) > 0:
+                      subprocess.run(["ffmpeg", "-y", "-i", raw, "-c", "copy", final_mp4], check=False)
 
-          mp4s = [
-              f for f in glob.glob(os.path.join(OUT_DIR, "*.mp4"))
-              if not f.endswith("_flv.mp4") and not f.endswith("_raw.mp4") and os.path.getsize(f) > 0
-          ]
-          if not mp4s:
-              raise SystemExit(0)
+              mp4s = [
+                  f for f in glob.glob(os.path.join(OUT_DIR, "*.mp4"))
+                  if not f.endswith("_flv.mp4") and not f.endswith("_raw.mp4") and os.path.getsize(f) > 0
+              ]
+              if mp4s:
+                  subprocess.run([
+                      "gh", "release", "create", TAG,
+                      "--title", f"Archive ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+                      "--notes", "الفيديو الخام + مشغل TikTok_Player.html التفاعلي + ملف التعليقات (.ass / .srt)"
+                  ], check=False)
 
-          subprocess.run([
-              "gh", "release", "create", TAG,
-              "--title", f"تسجيل بث ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
-              "--notes", "الفيديو الخام + مشغل TikTok_Player.html التفاعلي + ملف التعليقات (.ass / .srt)"
-          ], check=False)
-
-          for mp4 in mp4s:
-              srt_path = mp4.replace(".mp4", ".srt")
-              json_path = mp4.replace(".mp4", ".json")
-              events = []
-              if os.path.exists(json_path):
-                  try:
-                      with open(json_path, "r", encoding="utf-8") as jf:
-                          events = json.load(jf)
-                  except Exception:
-                      pass
-              if not events and os.path.exists(srt_path):
-                  events = parse_srt(srt_path)
-              mp4_name = os.path.basename(mp4)
-              video_url = f"https://github.com/{REPO}/releases/download/{TAG}/{mp4_name}"
-              html_path = os.path.join(OUT_DIR, "TikTok_Player.html")
-              ass_path = mp4.replace(".mp4", ".ass")
-              build_html(video_url, events, html_path)
-              write_ass(events, ass_path)
-              for f in [mp4, html_path, ass_path, srt_path, json_path]:
-                  if os.path.exists(f) and os.path.getsize(f) > 0:
-                      subprocess.run(["gh", "release", "upload", TAG, f, "--clobber"], check=False)
+                  for mp4 in mp4s:
+                      srt_path = mp4.replace(".mp4", ".srt")
+                      json_path = mp4.replace(".mp4", ".json")
+                      events = []
+                      if os.path.exists(json_path):
+                          try:
+                              with open(json_path, "r", encoding="utf-8") as jf:
+                                  events = json.load(jf)
+                          except Exception:
+                              pass
+                      if not events and os.path.exists(srt_path):
+                          events = parse_srt(srt_path)
+                      mp4_name = os.path.basename(mp4)
+                      video_url = f"https://github.com/{REPO}/releases/download/{TAG}/{mp4_name}"
+                      html_path = os.path.join(OUT_DIR, "TikTok_Player.html")
+                      ass_path = mp4.replace(".mp4", ".ass")
+                      build_html(video_url, events, html_path)
+                      write_ass(events, ass_path)
+                      for f in [mp4, html_path, ass_path, srt_path, json_path]:
+                          if os.path.exists(f) and os.path.getsize(f) > 0:
+                              subprocess.run(["gh", "release", "upload", TAG, f, "--clobber"], check=False)
           EOF
+          gh workflow run record.yml || true
