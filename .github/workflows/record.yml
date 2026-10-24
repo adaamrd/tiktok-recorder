@@ -28,52 +28,6 @@ permissions:
   actions: write
 
 jobs:
-  fix_existing:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Fix Video Seeking Freeze on Today's Recorded Stream
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          command -v ffmpeg >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y ffmpeg)
-          python3 - << 'EOF'
-          import os, json, glob, subprocess
-
-          res = subprocess.run(["gh", "release", "list", "--limit", "3", "--json", "tagName"], capture_output=True, text=True)
-          if res.returncode == 0 and res.stdout.strip():
-              for item in json.loads(res.stdout):
-                  tag = item["tagName"]
-                  vres = subprocess.run(["gh", "release", "view", tag, "--json", "assets,body"], capture_output=True, text=True)
-                  if vres.returncode != 0:
-                      continue
-                  data = json.loads(vres.stdout)
-                  if "SEEK_FIXED" in (data.get("body") or ""):
-                      continue
-                  assets = data.get("assets", [])
-                  mp4s = [a["name"] for a in assets if a["name"].endswith(".mp4")]
-                  if mp4s:
-                      os.makedirs("tmp_fix", exist_ok=True)
-                      mp4_name = mp4s[0]
-                      local_in = os.path.join("tmp_fix", mp4_name)
-                      local_out = os.path.join("tmp_fix", "fixed_" + mp4_name)
-                      subprocess.run(["gh", "release", "download", tag, "-p", mp4_name, "-D", "tmp_fix", "--clobber"], check=False)
-                      if os.path.exists(local_in) and os.path.getsize(local_in) > 0:
-                          subprocess.run([
-                              "ffmpeg", "-y", "-fflags", "+genpts+igndts", "-i", local_in,
-                              "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=30",
-                              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-g", "60",
-                              "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", local_out
-                          ], check=False)
-                          if os.path.exists(local_out) and os.path.getsize(local_out) > 0:
-                              os.replace(local_out, local_in)
-                              subprocess.run(["gh", "release", "upload", tag, local_in, "--clobber"], check=False)
-                              subprocess.run(["gh", "release", "edit", tag, "--notes", "تم إصلاح التقديم والتأخير (SEEK_FIXED) + مشغل TikTok_Player.html"], check=False)
-          EOF
-
   record:
     runs-on: ubuntu-latest
     timeout-minutes: 350
@@ -96,7 +50,33 @@ jobs:
           ~/.local/bin/uv sync
           ~/.local/bin/uv pip install TikTokLive yt-dlp
 
-      - name: Prepare UI Builder & Video Fixer Script
+          cat << 'VMEOF' > src/core/video_management.py
+          import os, subprocess
+          from utils.logger_manager import logger
+
+          class VideoManagement:
+              @staticmethod
+              def convert_flv_to_mp4(file):
+                  logger.info(f"Converting {file} to MP4 with PK-safe HD keyframes...")
+                  out_mp4 = file.replace('_flv.mp4', '.mp4')
+                  subprocess.run([
+                      "ffmpeg", "-y", "-fflags", "+genpts+igndts", "-i", file,
+                      "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
+                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-g", "60", "-pix_fmt", "yuv420p",
+                      "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_mp4
+                  ], check=False)
+                  if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0:
+                      try:
+                          os.remove(file)
+                      except Exception:
+                          pass
+                  logger.info("Finished converting FLV to HD MP4.")
+          VMEOF
+
+      - name: Prepare UI Builder & Player Updater
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           cat << 'PYEOF' > ui_builder.py
           import os, re, json, subprocess
@@ -113,19 +93,6 @@ jobs:
               for k, v in EMOJI_MAP.items():
                   text = text.replace(k, v)
               return re.sub(r"\[[a-zA-Z0-9_]+\]", "😂", text)
-
-          def fix_video_seeking(mp4_path):
-              if not os.path.exists(mp4_path) or os.path.getsize(mp4_path) == 0:
-                  return
-              fixed_path = mp4_path + ".fixed.mp4"
-              subprocess.run([
-                  "ffmpeg", "-y", "-fflags", "+genpts+igndts", "-i", mp4_path,
-                  "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=30",
-                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-g", "60",
-                  "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", fixed_path
-              ], check=False)
-              if os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 0:
-                  os.replace(fixed_path, mp4_path)
 
           def parse_srt(srt_path):
               events = []
@@ -169,32 +136,46 @@ jobs:
           <title>TikTok Live Replay</title>
           <style>
           :root {
-            --vid-y: 42%;
+            --vid-y: 50%;
+            --vid-x: 50%;
             --vid-scale: 1;
-            --chat-top: 68%;
+            --vid-sx: 1;
+            --vid-sy: 1;
+            --vid-fit: cover;
+            --chat-top: 64%;
             --chat-bottom: 24px;
+            --chat-width: 96%;
             --chat-font: 13px;
             --chat-bg: 0.45;
           }
           * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; font-family: sans-serif; }
           body, html { width: 100%; height: 100%; background: #000; overflow: hidden; color: #fff; }
-          #app { position: fixed; inset: 0; width: 100%; height: 100%; max-width: 500px; margin: 0 auto; background: #000; overflow: hidden; }
-          video { position: absolute; top: var(--vid-y); left: 50%; transform: translate(-50%, -50%) scale(var(--vid-scale)); width: 100%; height: 100%; object-fit: contain; z-index: 1; }
+          #app { position: fixed; inset: 0; width: 100%; height: 100%; max-width: 540px; margin: 0 auto; background: #000; overflow: hidden; }
+          video {
+            position: absolute;
+            top: var(--vid-y);
+            left: var(--vid-x);
+            transform: translate(-50%, -50%) scale(calc(var(--vid-scale) * var(--vid-sx)), calc(var(--vid-scale) * var(--vid-sy)));
+            width: 100%;
+            height: 100%;
+            object-fit: var(--vid-fit);
+            z-index: 1;
+          }
           #touch-zone { position: absolute; inset: 0; z-index: 5; }
-          #big-play { position: absolute; top: 45%; left: 50%; transform: translate(-50%, -50%); z-index: 25; background: rgba(255,0,80,0.9); color: #fff; border: none; border-radius: 30px; padding: 12px 24px; font-size: 15px; font-weight: bold; cursor: pointer; white-space: nowrap; }
+          #big-play { position: absolute; top: 48%; left: 50%; transform: translate(-50%, -50%); z-index: 25; background: rgba(255,0,80,0.9); color: #fff; border: none; border-radius: 30px; padding: 12px 24px; font-size: 15px; font-weight: bold; cursor: pointer; white-space: nowrap; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
           #gesture-badge { position: absolute; top: 52px; left: 50%; transform: translateX(-50%); z-index: 35; background: rgba(0,0,0,0.85); color: #fde047; padding: 5px 14px; border-radius: 20px; font-size: 13px; font-weight: bold; display: none; pointer-events: none; }
           #hud { position: absolute; top: 8px; left: 8px; right: 8px; z-index: 30; display: flex; justify-content: space-between; align-items: center; transition: opacity 0.35s ease; pointer-events: auto; }
           #hud.idle { opacity: 0; pointer-events: none; }
           .hud-group { display: flex; align-items: center; gap: 4px; }
-          .mini-btn { background: rgba(20,20,20,0.7); border: 1px solid rgba(255,255,255,0.2); color: #fff; border-radius: 16px; padding: 4px 8px; font-size: 11px; font-weight: bold; cursor: pointer; backdrop-filter: blur(4px); }
+          .mini-btn { background: rgba(20,20,20,0.75); border: 1px solid rgba(255,255,255,0.22); color: #fff; border-radius: 16px; padding: 4px 8px; font-size: 11px; font-weight: bold; cursor: pointer; backdrop-filter: blur(4px); }
           .mini-btn.active { background: #ff0050; border-color: #ff0050; }
           #ui-layer { position: absolute; inset: 0; z-index: 10; transition: transform 0.3s ease, opacity 0.3s ease; pointer-events: none; }
           #ui-layer.hidden { transform: translateX(100%); opacity: 0; }
           #supporters-bar { position: absolute; top: 42px; right: 8px; left: 8px; display: none; gap: 5px; overflow-x: auto; pointer-events: auto; scrollbar-width: none; }
-          .sup-pill { background: rgba(250,204,21,0.2); border: 1px solid rgba(250,204,21,0.5); color: #fde047; border-radius: 14px; padding: 2px 8px; font-size: 11px; font-weight: bold; white-space: nowrap; }
-          #chat-box { position: absolute; top: var(--chat-top); bottom: var(--chat-bottom); right: 8px; left: 8px; overflow-y: auto; display: flex; flex-direction: column; gap: 5px; pointer-events: auto; touch-action: pan-y; scrollbar-width: none; mask-image: linear-gradient(to bottom, transparent 0%, black 12%); -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 12%); }
+          .sup-pill { background: rgba(250,204,21,0.22); border: 1px solid rgba(250,204,21,0.55); color: #fde047; border-radius: 14px; padding: 2px 8px; font-size: 11px; font-weight: bold; white-space: nowrap; }
+          #chat-box { position: absolute; top: var(--chat-top); bottom: var(--chat-bottom); right: 8px; width: var(--chat-width); overflow-y: auto; display: flex; flex-direction: column; gap: 5px; pointer-events: auto; touch-action: pan-y; scrollbar-width: none; mask-image: linear-gradient(to bottom, transparent 0%, black 12%); -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 12%); }
           #chat-box::-webkit-scrollbar { display: none; }
-          .chat-msg { display: flex; align-items: flex-start; gap: 7px; background: rgba(0,0,0,var(--chat-bg)); padding: 4px 9px; border-radius: 14px; width: fit-content; max-width: 96%; }
+          .chat-msg { display: flex; align-items: flex-start; gap: 7px; background: rgba(0,0,0,var(--chat-bg)); padding: 4px 9px; border-radius: 14px; width: fit-content; max-width: 98%; }
           .chat-msg.gift-msg { background: rgba(234,179,8,0.3); border: 1px solid rgba(250,204,21,0.45); }
           .chat-avatar { width: 22px; height: 22px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 11px; color: #fff; overflow: hidden; }
           .chat-avatar img { width: 100%; height: 100%; object-fit: cover; }
@@ -203,13 +184,16 @@ jobs:
           .chat-text { color: #fff; }
           body.cc-mode .chat-avatar { display: none; }
           body.cc-mode .chat-msg { background: rgba(0,0,0,0.75); align-self: center; border-radius: 8px; padding: 3px 10px; }
-          #controls-bar { position: absolute; bottom: 0; left: 0; right: 0; height: 18px; z-index: 25; display: flex; align-items: center; padding: 0 8px; background: linear-gradient(transparent, rgba(0,0,0,0.8)); transition: opacity 0.35s ease; pointer-events: auto; }
+          #controls-bar { position: absolute; bottom: 0; left: 0; right: 0; height: 20px; z-index: 25; display: flex; align-items: center; padding: 0 8px; background: linear-gradient(transparent, rgba(0,0,0,0.85)); transition: opacity 0.35s ease; pointer-events: auto; }
           #controls-bar.idle { opacity: 0.25; }
           #seek { width: 100%; height: 4px; accent-color: #ff0050; cursor: pointer; }
-          #settings-panel { position: absolute; top: 44px; left: 10px; right: 10px; z-index: 40; background: rgba(18,18,18,0.95); border: 1px solid rgba(255,255,255,0.2); border-radius: 16px; padding: 12px; display: none; flex-direction: column; gap: 9px; pointer-events: auto; backdrop-filter: blur(8px); }
-          .set-row { display: flex; align-items: center; justify-content: space-between; font-size: 12px; gap: 8px; }
-          .set-row input[type=range] { flex: 1; accent-color: #ff0050; }
-          .set-row span { min-width: 120px; color: #ddd; }
+          #settings-panel { position: absolute; top: 42px; left: 8px; right: 8px; max-height: 82vh; overflow-y: auto; z-index: 40; background: rgba(15,15,15,0.96); border: 1px solid rgba(255,255,255,0.22); border-radius: 16px; padding: 12px; display: none; flex-direction: column; gap: 8px; pointer-events: auto; backdrop-filter: blur(10px); }
+          .set-title { font-size: 12px; font-weight: bold; color: #fde047; margin-top: 2px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 3px; }
+          .set-row { display: flex; align-items: center; justify-content: space-between; font-size: 11px; gap: 6px; }
+          .set-row input[type=range] { flex: 1; accent-color: #ff0050; height: 5px; }
+          .set-row span { min-width: 115px; color: #eee; }
+          .btn-row { display: flex; gap: 5px; flex-wrap: wrap; }
+          .btn-row .mini-btn { flex: 1; text-align: center; padding: 5px 4px; }
           #local-file { display: none; }
           </style>
           </head>
@@ -217,7 +201,7 @@ jobs:
           <div id="app">
             <video id="vid" src="__VIDEO_URL__" playsinline></video>
             <div id="touch-zone"></div>
-            <button id="big-play" onclick="handleBigPlay()">📁 اضغط لاختيار الفيديو وتشغيله</button>
+            <button id="big-play" onclick="handleBigPlay()">▶️ تشغيل البث</button>
             <div id="gesture-badge"></div>
 
             <div id="hud">
@@ -237,27 +221,61 @@ jobs:
             </div>
 
             <div id="settings-panel">
-              <div class="set-row">
-                <span>مكان الفيديو (أعلى/أسفل):</span>
-                <input type="range" id="s-vid-y" min="25" max="55" value="42">
+              <div class="set-title">📱 أبعاد وملء شاشة الفيديو</div>
+              <div class="btn-row">
+                <button class="mini-btn active" id="fit-cover" onclick="setFit('cover')">📱 ملء الشاشة</button>
+                <button class="mini-btn" id="fit-contain" onclick="setFit('contain')">🖼️ احتواء (للقسط)</button>
+                <button class="mini-btn" id="fit-fill" onclick="setFit('fill')">↔️ تمديد كامل</button>
               </div>
               <div class="set-row">
-                <span>حجم الفيديو (تكبير):</span>
-                <input type="range" id="s-vid-scale" min="70" max="130" value="100">
+                <span>تكبير عام (Zoom):</span>
+                <input type="range" id="s-vid-scale" min="50" max="200" value="100">
               </div>
+              <div class="set-row">
+                <span>تمديد العرض (أفقي):</span>
+                <input type="range" id="s-vid-sx" min="70" max="160" value="100">
+              </div>
+              <div class="set-row">
+                <span>تمديد الطول (عمودي):</span>
+                <input type="range" id="s-vid-sy" min="70" max="160" value="100">
+              </div>
+              <div class="set-row">
+                <span>موقع الفيديو (أعلى/أسفل):</span>
+                <input type="range" id="s-vid-y" min="15" max="85" value="50">
+              </div>
+              <div class="set-row">
+                <span>موقع الفيديو (يمين/يسار):</span>
+                <input type="range" id="s-vid-x" min="20" max="80" value="50">
+              </div>
+
+              <div class="set-title">💬 تخصيص التعليقات والداعمين</div>
               <div class="set-row">
                 <span>بداية صندوق التعليقات:</span>
-                <input type="range" id="s-chat-top" min="45" max="85" value="68">
+                <input type="range" id="s-chat-top" min="30" max="88" value="64">
+              </div>
+              <div class="set-row">
+                <span>عرض صندوق التعليقات:</span>
+                <input type="range" id="s-chat-width" min="50" max="100" value="96">
               </div>
               <div class="set-row">
                 <span>حجم خط التعليقات:</span>
-                <input type="range" id="s-chat-font" min="10" max="20" value="13">
+                <input type="range" id="s-chat-font" min="10" max="24" value="13">
               </div>
               <div class="set-row">
                 <span>شفافية خلفية التعليق:</span>
-                <input type="range" id="s-chat-bg" min="0" max="90" value="45">
+                <input type="range" id="s-chat-bg" min="0" max="95" value="45">
               </div>
-              <div style="display:flex;justify-content:space-between;margin-top:4px;">
+
+              <div class="set-title">⚡ السرعة والعناصر</div>
+              <div class="btn-row">
+                <button class="mini-btn" onclick="setSpeed(0.75)">0.75x</button>
+                <button class="mini-btn active" id="sp-1" onclick="setSpeed(1)">1x</button>
+                <button class="mini-btn" onclick="setSpeed(1.25)">1.25x</button>
+                <button class="mini-btn" onclick="setSpeed(1.5)">1.5x</button>
+                <button class="mini-btn" onclick="setSpeed(2)">2x</button>
+              </div>
+              <div style="display:flex;justify-content:space-between;gap:6px;margin-top:4px;">
+                <button class="mini-btn" onclick="toggleSupBar()">👑 إظهار/إخفاء الداعمين</button>
                 <button class="mini-btn" onclick="resetSettings()">🔄 افتراضي</button>
                 <button class="mini-btn active" onclick="toggleSettings()">✓ إغلاق</button>
               </div>
@@ -290,7 +308,8 @@ jobs:
           const likesPill = document.getElementById('likes-count');
           const supBar = document.getElementById('supporters-bar');
           const COLORS = ['#ef4444','#f97316','#eab308','#22c55e','#06b6d4','#3b82f6','#a855f7','#ec4899'];
-          var hasLoadedVideo = false;
+          var currentFit = 'cover';
+          var hideSupporters = false;
 
           var idleTimer = null;
           function wakeHUD() {
@@ -306,49 +325,90 @@ jobs:
           }
 
           function handleBigPlay() {
-            if (!hasLoadedVideo) {
-              document.getElementById('local-file').click();
-            } else {
-              togglePlay();
+            var p = vid.play();
+            if (p && p.catch) {
+              p.catch(function() {
+                document.getElementById('local-file').click();
+              });
             }
+          }
+
+          function setFit(mode) {
+            currentFit = mode;
+            document.documentElement.style.setProperty('--vid-fit', mode);
+            ['cover','contain','fill'].forEach(function(m) {
+              var b = document.getElementById('fit-' + m);
+              if (b) b.classList.toggle('active', m === mode);
+            });
+            applySettings();
+          }
+
+          function setSpeed(r) {
+            vid.playbackRate = r;
+            showBadge('⚡ السرعة ' + r + 'x', 800);
+          }
+
+          function toggleSupBar() {
+            hideSupporters = !hideSupporters;
+            supBar.style.display = hideSupporters ? 'none' : 'flex';
           }
 
           function applySettings() {
             var vy = document.getElementById('s-vid-y').value;
+            var vx = document.getElementById('s-vid-x').value;
             var vs = document.getElementById('s-vid-scale').value;
+            var vsx = document.getElementById('s-vid-sx').value;
+            var vsy = document.getElementById('s-vid-sy').value;
             var ct = document.getElementById('s-chat-top').value;
+            var cw = document.getElementById('s-chat-width').value;
             var cf = document.getElementById('s-chat-font').value;
             var cb = document.getElementById('s-chat-bg').value;
             document.documentElement.style.setProperty('--vid-y', vy + '%');
+            document.documentElement.style.setProperty('--vid-x', vx + '%');
             document.documentElement.style.setProperty('--vid-scale', (vs / 100));
+            document.documentElement.style.setProperty('--vid-sx', (vsx / 100));
+            document.documentElement.style.setProperty('--vid-sy', (vsy / 100));
             document.documentElement.style.setProperty('--chat-top', ct + '%');
+            document.documentElement.style.setProperty('--chat-width', cw + '%');
             document.documentElement.style.setProperty('--chat-font', cf + 'px');
             document.documentElement.style.setProperty('--chat-bg', (cb / 100));
-            try { localStorage.setItem('tt_cfg', JSON.stringify({vy:vy, vs:vs, ct:ct, cf:cf, cb:cb})); } catch(e){}
+            try {
+              localStorage.setItem('tt_cfg_v2', JSON.stringify({
+                vy:vy, vx:vx, vs:vs, vsx:vsx, vsy:vsy, ct:ct, cw:cw, cf:cf, cb:cb, fit:currentFit
+              }));
+            } catch(e){}
           }
 
           function resetSettings() {
-            document.getElementById('s-vid-y').value = 42;
+            document.getElementById('s-vid-y').value = 50;
+            document.getElementById('s-vid-x').value = 50;
             document.getElementById('s-vid-scale').value = 100;
-            document.getElementById('s-chat-top').value = 68;
+            document.getElementById('s-vid-sx').value = 100;
+            document.getElementById('s-vid-sy').value = 100;
+            document.getElementById('s-chat-top').value = 64;
+            document.getElementById('s-chat-width').value = 96;
             document.getElementById('s-chat-font').value = 13;
             document.getElementById('s-chat-bg').value = 45;
-            applySettings();
+            setFit('cover');
           }
 
           try {
-            var saved = JSON.parse(localStorage.getItem('tt_cfg') || 'null');
+            var saved = JSON.parse(localStorage.getItem('tt_cfg_v2') || 'null');
             if (saved) {
-              document.getElementById('s-vid-y').value = saved.vy || 42;
+              document.getElementById('s-vid-y').value = saved.vy || 50;
+              document.getElementById('s-vid-x').value = saved.vx || 50;
               document.getElementById('s-vid-scale').value = saved.vs || 100;
-              document.getElementById('s-chat-top').value = saved.ct || 68;
+              document.getElementById('s-vid-sx').value = saved.vsx || 100;
+              document.getElementById('s-vid-sy').value = saved.vsy || 100;
+              document.getElementById('s-chat-top').value = saved.ct || 64;
+              document.getElementById('s-chat-width').value = saved.cw || 96;
               document.getElementById('s-chat-font').value = saved.cf || 13;
               document.getElementById('s-chat-bg').value = saved.cb !== undefined ? saved.cb : 45;
-              applySettings();
+              setFit(saved.fit || 'cover');
             }
           } catch(e){}
 
-          ['s-vid-y','s-vid-scale','s-chat-top','s-chat-font','s-chat-bg'].forEach(function(id) {
+          ['s-vid-y','s-vid-x','s-vid-scale','s-vid-sx','s-vid-sy','s-chat-top','s-chat-width','s-chat-font','s-chat-bg'].forEach(function(id) {
             document.getElementById(id).addEventListener('input', applySettings);
           });
 
@@ -392,8 +452,6 @@ jobs:
 
           document.getElementById('local-file').addEventListener('change', function(e) {
             if (e.target.files && e.target.files[0]) {
-              hasLoadedVideo = true;
-              bigPlay.textContent = '▶️ تشغيل';
               vid.src = URL.createObjectURL(e.target.files[0]);
               vid.play();
             }
@@ -405,8 +463,6 @@ jobs:
             wakeHUD();
           }
           vid.addEventListener('play', function() {
-            hasLoadedVideo = true;
-            bigPlay.textContent = '▶️ تشغيل';
             bigPlay.style.display = 'none';
             wakeHUD();
           });
@@ -504,7 +560,7 @@ jobs:
             if (ev.type === 'stats') {
               if (ev.v) { viewerPill.style.display = 'inline-block'; viewerPill.textContent = '👁️ ' + ev.v; }
               if (ev.l) { likesPill.style.display = 'inline-block'; likesPill.textContent = '❤️ ' + ev.l; }
-              if (ev.sup && ev.sup.length) {
+              if (ev.sup && ev.sup.length && !hideSupporters) {
                 supBar.style.display = 'flex';
                 supBar.innerHTML = ev.sup.map(function(s) { return '<span class="sup-pill">👑 ' + s + '</span>'; }).join('');
               }
@@ -524,8 +580,6 @@ jobs:
 
           var lastIdx = 0;
           vid.addEventListener('loadedmetadata', function() {
-            hasLoadedVideo = true;
-            bigPlay.textContent = '▶️ تشغيل';
             if (vid.duration && isFinite(vid.duration)) seek.max = vid.duration;
           });
           seek.addEventListener('input', function() {
@@ -555,6 +609,45 @@ jobs:
                   f.write(out)
           PYEOF
 
+          python3 - << 'EOF'
+          import os, json, glob, subprocess
+          from ui_builder import parse_srt, build_html
+
+          REPO = os.environ.get("REPO", "adaamrd/tiktok-recorder")
+          res = subprocess.run(["gh", "release", "list", "--limit", "5", "--json", "tagName"], capture_output=True, text=True)
+          if res.returncode == 0 and res.stdout.strip():
+              for item in json.loads(res.stdout):
+                  tag = item["tagName"]
+                  vres = subprocess.run(["gh", "release", "view", tag, "--json", "assets"], capture_output=True, text=True)
+                  if vres.returncode != 0:
+                      continue
+                  assets = json.loads(vres.stdout).get("assets", [])
+                  mp4s = [a["name"] for a in assets if a["name"].endswith(".mp4")]
+                  jsons = [a["name"] for a in assets if a["name"].endswith(".json")]
+                  srts = [a["name"] for a in assets if a["name"].endswith(".srt")]
+                  if mp4s:
+                      os.makedirs("tmp_ui", exist_ok=True)
+                      events = []
+                      if jsons:
+                          subprocess.run(["gh", "release", "download", tag, "-p", jsons[0], "-D", "tmp_ui", "--clobber"], check=False)
+                          jp = os.path.join("tmp_ui", jsons[0])
+                          if os.path.exists(jp):
+                              try:
+                                  with open(jp, "r", encoding="utf-8") as f:
+                                      events = json.load(f)
+                              except Exception:
+                                  pass
+                      if not events and srts:
+                          subprocess.run(["gh", "release", "download", tag, "-p", srts[0], "-D", "tmp_ui", "--clobber"], check=False)
+                          sp = os.path.join("tmp_ui", srts[0])
+                          if os.path.exists(sp):
+                              events = parse_srt(sp)
+                      video_url = f"https://github.com/{REPO}/releases/download/{tag}/{mp4s[0]}"
+                      hp = os.path.join("tmp_ui", "TikTok_Player.html")
+                      build_html(video_url, events, hp)
+                      subprocess.run(["gh", "release", "upload", tag, hp, "--clobber"], check=False)
+          EOF
+
       - name: Run 24/7 Non-Stop Smart Monitor
         env:
           GH_TOKEN: ${{ github.token }}
@@ -566,7 +659,7 @@ jobs:
           cat << 'EOF' > manager.py
           import os, sys, time, glob, json, signal, subprocess, asyncio, threading
           from datetime import datetime
-          from ui_builder import parse_srt, write_ass, build_html, clean_emojis, fix_video_seeking
+          from ui_builder import parse_srt, write_ass, build_html, clean_emojis
 
           USER = os.environ.get("TARGET_USER", "da3bolgaming").strip().lstrip("@")
           REPO = os.environ.get("REPO", "adaamrd/tiktok-recorder")
@@ -584,7 +677,7 @@ jobs:
               subprocess.run([
                   "gh", "release", "create", TAG,
                   "--title", f"Archive ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
-                  "--notes", "SEEK_FIXED + مشغل TikTok_Player.html التفاعلي"
+                  "--notes", "جودة HD كاملة + دعم القسط + مشغل TikTok_Player.html المطور"
               ], check=False)
 
           def stealth_rename(filepath):
@@ -605,7 +698,6 @@ jobs:
               srt_path = stealth_rename(srt_orig) if os.path.exists(srt_orig) else mp4_path.replace(".mp4", ".srt")
               json_path = stealth_rename(json_orig) if os.path.exists(json_orig) else mp4_path.replace(".mp4", ".json")
 
-              fix_video_seeking(mp4_path)
               ensure_release()
               events = []
               if os.path.exists(json_path):
@@ -786,7 +878,7 @@ jobs:
           python3 - << 'EOF'
           import os, glob, time, json, subprocess
           from datetime import datetime
-          from ui_builder import parse_srt, write_ass, build_html, fix_video_seeking
+          from ui_builder import parse_srt, write_ass, build_html
 
           USER = os.environ.get("TARGET_USER", "da3bolgaming").strip().lstrip("@")
           REPO = os.environ.get("REPO", "adaamrd/tiktok-recorder")
@@ -801,7 +893,12 @@ jobs:
               for raw in glob.glob(os.path.join(OUT_DIR, "*_flv.mp4")) + glob.glob(os.path.join(OUT_DIR, "*_raw.mp4")):
                   final_mp4 = raw.replace("_flv.mp4", ".mp4").replace("_raw.mp4", ".mp4")
                   if not os.path.exists(final_mp4) and os.path.getsize(raw) > 0:
-                      subprocess.run(["ffmpeg", "-y", "-i", raw, "-c", "copy", final_mp4], check=False)
+                      subprocess.run([
+                          "ffmpeg", "-y", "-fflags", "+genpts+igndts", "-i", raw,
+                          "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
+                          "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-g", "60", "-pix_fmt", "yuv420p",
+                          "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", final_mp4
+                      ], check=False)
 
               mp4s = [
                   f for f in glob.glob(os.path.join(OUT_DIR, "*.mp4"))
@@ -811,13 +908,12 @@ jobs:
                   subprocess.run([
                       "gh", "release", "create", TAG,
                       "--title", f"Archive ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
-                      "--notes", "SEEK_FIXED + مشغل TikTok_Player.html التفاعلي"
+                      "--notes", "جودة HD كاملة + دعم القسط + مشغل TikTok_Player.html المطور"
                   ], check=False)
 
                   for mp4 in mp4s:
                       srt_path = mp4.replace(".mp4", ".srt")
                       json_path = mp4.replace(".mp4", ".json")
-                      fix_video_seeking(mp4)
                       events = []
                       if os.path.exists(json_path):
                           try:
