@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 350
     concurrency:
       group: unified-tiktok-recorder
-      cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+      cancel-in-progress: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -171,26 +171,36 @@ jobs:
                               base_events = loaded
                   except Exception:
                       base_events = []
+              base_events = [e for e in base_events if isinstance(e, dict)]
               srt_events = parse_srt(srt_path) if srt_path else []
-              ass_events = parse_ass(ass_path) if ass_path else []
-              extra_chats = srt_events + ass_events
-              seen_chats = set()
+              extra_chats = srt_events if srt_events else (parse_ass(ass_path) if ass_path else [])
+              base_counts = {}
               for ev in base_events:
                   if ev.get("type") in ("chat", "gift"):
-                      seen_chats.add((int(ev.get("t", 0)) // 2, str(ev.get("u", "")).strip(), str(ev.get("c", "")).strip()))
+                      k = (int(ev.get("t", 0)), str(ev.get("u", "")).strip(), str(ev.get("c", "")).strip())
+                      base_counts[k] = base_counts.get(k, 0) + 1
+              extra_counts = {}
               merged = list(base_events)
               for ev in extra_chats:
-                  key = (int(ev.get("t", 0)) // 2, str(ev.get("u", "")).strip(), str(ev.get("c", "")).strip())
-                  if key not in seen_chats:
-                      seen_chats.add(key)
+                  if not isinstance(ev, dict):
+                      continue
+                  k = (int(ev.get("t", 0)), str(ev.get("u", "")).strip(), str(ev.get("c", "")).strip())
+                  extra_counts[k] = extra_counts.get(k, 0) + 1
+                  if extra_counts[k] > base_counts.get(k, 0):
                       merged.append(ev)
               merged.sort(key=lambda x: int(x.get("t", 0)))
               if json_path and merged:
+                  tmp_j = f"{json_path}.{os.getpid()}.tmp"
                   try:
-                      with open(json_path, "w", encoding="utf-8") as jf:
+                      with open(tmp_j, "w", encoding="utf-8") as jf:
                           json.dump(merged, jf, ensure_ascii=False)
+                          jf.flush()
+                          os.fsync(jf.fileno())
+                      os.replace(tmp_j, json_path)
                   except Exception:
-                      pass
+                      if os.path.exists(tmp_j):
+                          try: os.remove(tmp_j)
+                          except Exception: pass
               return merged
 
           def compact_events(events):
@@ -1276,10 +1286,17 @@ jobs:
                   salvage_path = raw_flv
               if upload_asset_with_retry(tag, salvage_path, verify_exact=True, retries=3):
                   base_p = raw_flv[:-8]
+                  side_ok = True
                   for ext in (".json", ".srt", ".ass"):
                       side_f = base_p + ext
                       if os.path.exists(side_f) and os.path.getsize(side_f) > 0:
-                          upload_asset_with_retry(tag, side_f, verify_exact=False, retries=3)
+                          if not upload_asset_with_retry(tag, side_f, verify_exact=True, retries=3):
+                              side_ok = False
+                  if not side_ok:
+                      if salvage_path != raw_flv and os.path.exists(salvage_path):
+                          try: os.remove(salvage_path)
+                          except Exception: pass
+                      return False
                   if u in state:
                       state[u]["uploaded"].add(base_p)
                   for p in (salvage_path, raw_flv):
@@ -1297,7 +1314,8 @@ jobs:
                   os.path.expanduser("~/.local/bin/uv"), "run", "python", "src/main.py",
                   "-user", u, "-mode", "automatic", "-automatic_interval", "1", "-output", u_dir
               ]
-              return subprocess.Popen(cmd, cwd="tiktok-live-recorder", start_new_session=True)
+              clean_env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "TIKTOK_COOKIES")}
+              return subprocess.Popen(cmd, cwd="tiktok-live-recorder", env=clean_env, start_new_session=True)
 
           def init_user_worker(u, guest_of=None):
               if stop_requested:
@@ -1806,6 +1824,7 @@ jobs:
               return not pending
 
           if os.environ.get("FLUSH_ONLY") == "1":
+              ok = True
               if os.path.exists(OUT_DIR):
                   for d in os.listdir(OUT_DIR):
                       p = os.path.join(OUT_DIR, d)
@@ -1872,6 +1891,7 @@ jobs:
         run: |
           QUEUED=$(gh run list --workflow=recorder.yml --status=queued --json databaseId --jq 'length' 2>/dev/null || echo "0")
           WAITING=$(gh run list --workflow=recorder.yml --status=waiting --json databaseId --jq 'length' 2>/dev/null || echo "0")
-          if [ "${QUEUED:-0}" -eq 0 ] && [ "${WAITING:-0}" -eq 0 ]; then
+          PENDING=$(gh run list --workflow=recorder.yml --status=pending --json databaseId --jq 'length' 2>/dev/null || echo "0")
+          if [ "${QUEUED:-0}" -eq 0 ] && [ "${WAITING:-0}" -eq 0 ] && [ "${PENDING:-0}" -eq 0 ]; then
             gh workflow run recorder.yml -f hours=5 -f extra_host="$EXTRA_HOST" || true
           fi
