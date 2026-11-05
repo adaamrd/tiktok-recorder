@@ -173,7 +173,7 @@ jobs:
                       base_events = []
               srt_events = parse_srt(srt_path) if srt_path else []
               ass_events = parse_ass(ass_path) if ass_path else []
-              extra_chats = srt_events if len(srt_events) >= len(ass_events) else ass_events
+              extra_chats = srt_events + ass_events
               if not base_events:
                   return extra_chats
               seen_chats = set()
@@ -1267,13 +1267,18 @@ jobs:
               session_tags[u] = tag
               salvage_path = raw_flv.replace("_flv.mp4", "_RAW_BACKUP.flv")
               try:
-                  os.replace(raw_flv, salvage_path)
+                  shutil.copyfile(raw_flv, salvage_path)
               except Exception:
                   salvage_path = raw_flv
               if upload_asset_with_retry(tag, salvage_path, verify_exact=True, retries=3):
+                  for p in (salvage_path, raw_flv):
+                      if p and os.path.exists(p):
+                          try: os.remove(p)
+                          except Exception: pass
+                  return True
+              if salvage_path != raw_flv and os.path.exists(salvage_path):
                   try: os.remove(salvage_path)
                   except Exception: pass
-                  return True
               return False
 
           def spawn_recorder_proc(u, u_dir):
@@ -1300,7 +1305,8 @@ jobs:
                           if st["proc"] is None or st["proc"].poll() is not None:
                               st["proc"] = spawn_recorder_proc(u, st["dir"])
                       return
-                  if guest_of and len(guest_host_label) >= 6:
+                  active_guests_now = sum(1 for h in guest_host_label if h in state and not state[h]["stopped"])
+                  if guest_of and active_guests_now >= 6:
                       return
                   u_dir = os.path.join(OUT_DIR, u)
                   os.makedirs(u_dir, exist_ok=True)
@@ -1446,12 +1452,17 @@ jobs:
               if upload_asset_with_retry(tag, mp4_path, verify_exact=True, retries=3):
                   st["max_part_size"] = max(st.get("max_part_size", 0), local_mp4_sz)
                   st["part_count"] = st.get("part_count", 0) + 1
-                  aux_files = [part_html_path, thumb_path, ass_path, srt_path, json_path]
-                  if update_main_player:
-                      aux_files.append(html_path)
-                  for f in aux_files:
-                      if os.path.exists(f) and os.path.getsize(f) > 0:
-                          upload_asset_with_retry(tag, f, verify_exact=False, retries=3)
+                  player_ok = upload_asset_with_retry(tag, part_html_path, verify_exact=False, retries=3)
+                  meta_ok = True
+                  for req_f in (json_path, srt_path, ass_path):
+                      if os.path.exists(req_f) and os.path.getsize(req_f) > 0:
+                          if not upload_asset_with_retry(tag, req_f, verify_exact=False, retries=3):
+                              meta_ok = False
+                  for opt_f in ([thumb_path] + ([html_path] if update_main_player else [])):
+                      if os.path.exists(opt_f) and os.path.getsize(opt_f) > 0:
+                          upload_asset_with_retry(tag, opt_f, verify_exact=False, retries=3)
+                  if not (player_ok and meta_ok):
+                      return False
                   st["uploaded"].add(base_prefix)
                   st["uploaded"].add(clean_prefix)
                   for p in (mp4_path, raw_flv):
@@ -1712,6 +1723,14 @@ jobs:
                   cur_size = os.path.getsize(latest_flv)
                   if latest_flv != st["active_flv"]:
                       with st["lock"]:
+                          if st["active_flv"]:
+                              st["retired"].add(st["active_flv"])
+                          if st["json"] and st["events"]:
+                              try:
+                                  with open(st["json"], "w", encoding="utf-8") as jf:
+                                      json.dump(st["events"], jf, ensure_ascii=False)
+                              except Exception:
+                                  pass
                           st["active_flv"] = latest_flv
                           st["last_size"] = cur_size
                           st["last_growth"] = time.time()
