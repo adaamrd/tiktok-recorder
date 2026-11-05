@@ -174,8 +174,6 @@ jobs:
               srt_events = parse_srt(srt_path) if srt_path else []
               ass_events = parse_ass(ass_path) if ass_path else []
               extra_chats = srt_events + ass_events
-              if not base_events:
-                  return extra_chats
               seen_chats = set()
               for ev in base_events:
                   if ev.get("type") in ("chat", "gift"):
@@ -187,6 +185,12 @@ jobs:
                       seen_chats.add(key)
                       merged.append(ev)
               merged.sort(key=lambda x: int(x.get("t", 0)))
+              if json_path and merged:
+                  try:
+                      with open(json_path, "w", encoding="utf-8") as jf:
+                          json.dump(merged, jf, ensure_ascii=False)
+                  except Exception:
+                      pass
               return merged
 
           def compact_events(events):
@@ -1271,6 +1275,13 @@ jobs:
               except Exception:
                   salvage_path = raw_flv
               if upload_asset_with_retry(tag, salvage_path, verify_exact=True, retries=3):
+                  base_p = raw_flv[:-8]
+                  for ext in (".json", ".srt", ".ass"):
+                      side_f = base_p + ext
+                      if os.path.exists(side_f) and os.path.getsize(side_f) > 0:
+                          upload_asset_with_retry(tag, side_f, verify_exact=False, retries=3)
+                  if u in state:
+                      state[u]["uploaded"].add(base_p)
                   for p in (salvage_path, raw_flv):
                       if p and os.path.exists(p):
                           try: os.remove(p)
@@ -1292,12 +1303,15 @@ jobs:
               if stop_requested:
                   return
               with state_lock:
+                  active_guests_now = sum(1 for h in guest_host_label if h in state and not state[h]["stopped"])
                   if u in state:
                       guest_miss_count[u] = 0
                       if guest_of:
                           guest_host_label[u] = guest_of
                       st = state[u]
                       if st["stopped"] and not stop_requested:
+                          if guest_of and active_guests_now >= 6:
+                              return
                           st["stopped"] = False
                           st["last_growth"] = time.time()
                           if not (st.get("chat_thread") and st["chat_thread"].is_alive()):
@@ -1764,7 +1778,8 @@ jobs:
                   base_prefix = mp4[:-4]
                   async_upload_stream(u, base_prefix)
 
-          def final_flush(rounds=2):
+          def final_flush(rounds=4):
+              pending = False
               for _ in range(rounds):
                   pending = False
                   for u in list(state.keys()):
@@ -1786,8 +1801,9 @@ jobs:
                           if not upload_stream_prefix(u, bp):
                               pending = True
                   if not pending:
-                      break
+                      return True
                   time.sleep(10)
+              return not pending
 
           if os.environ.get("FLUSH_ONLY") == "1":
               if os.path.exists(OUT_DIR):
@@ -1801,8 +1817,8 @@ jobs:
                               "uploaded": set(), "uploading": set(), "retired": set(),
                               "max_part_size": 0, "part_count": 0, "stopped": True
                           }
-                  final_flush(rounds=2)
-              sys.exit(0)
+                  ok = final_flush(rounds=4)
+              sys.exit(0 if ok else 1)
 
           for u in list(USERS):
               init_user_worker(u)
@@ -1845,11 +1861,11 @@ jobs:
           pkill -TERM -f 'src/main.py -user' || true
           sleep 3
           if [ -f manager.py ] && [ -x ./tiktok-live-recorder/.venv/bin/python ]; then
-            FLUSH_ONLY=1 PYTHONPATH=. ./tiktok-live-recorder/.venv/bin/python manager.py || true
+            FLUSH_ONLY=1 PYTHONPATH=. ./tiktok-live-recorder/.venv/bin/python manager.py
           fi
 
       - name: Trigger Successor Run (Only When Queue Empty)
-        if: ${{ !cancelled() && fromJSON(inputs.hours || '5') >= 4.7 }}
+        if: ${{ always() && !cancelled() && fromJSON(inputs.hours || '5') >= 4.7 }}
         env:
           GH_TOKEN: ${{ github.token }}
           EXTRA_HOST: ${{ inputs.extra_host || '' }}
