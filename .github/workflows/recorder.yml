@@ -456,6 +456,7 @@ jobs:
                 </div>
               </div>
               <div id="supporters-bar"></div>
+              <div id="parts-bar" style="display:none;align-items:center;gap:5px;overflow-x:auto;pointer-events:auto;scrollbar-width:none;padding:2px 0;"></div>
               <div id="pk-bar">
                 <div id="pk-left-fill"></div>
                 <div id="pk-scores"><span id="pk-l-txt">0</span><span>⚡ PK</span><span id="pk-r-txt">0</span></div>
@@ -559,8 +560,10 @@ jobs:
             </div>
           </div>
           <script>
-          const EVENTS = __EVENTS_JSON__;
-          const THUMB_URL = "__THUMB_URL__";
+          let EVENTS = __EVENTS_JSON__;
+          let THUMB_URL = "__THUMB_URL__";
+          const PLAYLIST = __PLAYLIST_JSON__;
+          let currentPartIdx = 0;
           const appEl = document.getElementById('app');
           const vid = document.getElementById('vid');
           const prevVid = document.getElementById('prev-vid');
@@ -597,10 +600,57 @@ jobs:
           var totalDuration = EVENTS.length > 0 ? Math.max(60, EVENTS[EVENTS.length - 1].t + 15) : 3600;
           seek.max = totalDuration;
 
-          if (THUMB_URL) {
-            prevSprite.style.backgroundImage = 'url(' + THUMB_URL + ')';
-            prevSprite.style.display = 'block';
+          const partsBar = document.getElementById('parts-bar');
+          function applyThumbUrl(u) {
+            THUMB_URL = u || "";
+            if (THUMB_URL) {
+              prevSprite.style.backgroundImage = 'url(' + THUMB_URL + ')';
+              prevSprite.style.display = 'block';
+            } else {
+              prevSprite.style.display = 'none';
+            }
           }
+          applyThumbUrl(THUMB_URL);
+
+          function switchPlaylistPart(idx, autoPlay) {
+            if (!PLAYLIST || idx < 0 || idx >= PLAYLIST.length) return;
+            currentPartIdx = idx;
+            var item = PLAYLIST[idx];
+            vid.src = item.video_url;
+            applyThumbUrl(item.thumb_url || "");
+            EVENTS = item.events || [];
+            totalDuration = EVENTS.length > 0 ? Math.max(60, EVENTS[EVENTS.length - 1].t + 15) : 3600;
+            seek.max = totalDuration;
+            seek.value = 0;
+            chatBox.innerHTML = '';
+            lastIdx = 0;
+            renderMarkers();
+            renderPartsBar();
+            showBadge('🎬 جاري تشغيل الجزء ' + (idx + 1) + ' من ' + PLAYLIST.length, 1800);
+            if (autoPlay) handleBigPlay();
+          }
+
+          function renderPartsBar() {
+            if (!PLAYLIST || PLAYLIST.length <= 1) {
+              partsBar.style.display = 'none';
+              return;
+            }
+            partsBar.style.display = 'flex';
+            partsBar.innerHTML = '';
+            PLAYLIST.forEach(function(pt, i) {
+              var b = document.createElement('button');
+              b.className = 'mini-btn' + (i === currentPartIdx ? ' active' : '');
+              b.textContent = '🎬 الجزء ' + (i + 1);
+              b.onclick = function() { switchPlaylistPart(i, true); };
+              partsBar.appendChild(b);
+            });
+          }
+          renderPartsBar();
+          vid.addEventListener('ended', function() {
+            if (PLAYLIST && currentPartIdx + 1 < PLAYLIST.length) {
+              switchPlaylistPart(currentPartIdx + 1, true);
+            }
+          });
 
           function renderMarkers() {
             markersLayer.innerHTML = '';
@@ -1090,14 +1140,16 @@ jobs:
           </body>
           </html>"""
 
-          def build_html(video_url, events, out_html_path, thumb_url=""):
+          def build_html(video_url, events, out_html_path, thumb_url="", playlist=None):
               compacted = compact_events(events)
               safe_json = json.dumps(compacted, ensure_ascii=False).replace("</", "<\\/")
+              safe_pl = json.dumps(playlist or [], ensure_ascii=False).replace("</", "<\\/")
               out = (
                   PLAYER_HTML
                   .replace("__VIDEO_URL__", video_url)
                   .replace("__THUMB_URL__", thumb_url)
                   .replace("__EVENTS_JSON__", safe_json)
+                  .replace("__PLAYLIST_JSON__", safe_pl)
               )
               with open(out_html_path, "w", encoding="utf-8") as f:
                   f.write(out)
@@ -1113,7 +1165,7 @@ jobs:
           cat << 'EOF' > manager.py
           import os, re, sys, time, glob, json, shutil, signal, traceback, subprocess, asyncio, threading
           from datetime import datetime, timedelta
-          from ui_builder import load_and_merge_events, write_ass, build_html, clean_emojis, generate_sprite_sheet
+          from ui_builder import load_and_merge_events, compact_events, write_ass, build_html, clean_emojis, generate_sprite_sheet
 
           CORE_TARGETS = ["da3bolgaming", "f_oody7", "3absi1999"]
           USERS = list(CORE_TARGETS)
@@ -1243,6 +1295,63 @@ jobs:
                   return False
               except Exception:
                   return False
+
+          def get_or_reuse_session_tag(u, max_age_sec=10800):
+              if u in session_tags:
+                  return session_tags[u]
+              prefix = f"v-{u}-"
+              try:
+                  r = subprocess.run(["gh", "release", "list", "--limit", "10", "--json", "tagName"], capture_output=True, text=True, timeout=25)
+                  if r.returncode == 0 and r.stdout.strip():
+                      for item in json.loads(r.stdout):
+                          t = item.get("tagName", "")
+                          if t.startswith(prefix):
+                              ts_part = t[len(prefix):]
+                              if ts_part.isdigit() and (time.time() - int(ts_part)) <= max_age_sec:
+                                  vr = subprocess.run(["gh", "release", "view", t, "--json", "assets"], capture_output=True, text=True, timeout=25)
+                                  if vr.returncode == 0:
+                                      assets = json.loads(vr.stdout).get("assets") or []
+                                      if any(a.get("name", "").endswith(".mp4") for a in assets):
+                                          session_tags[u] = t
+                                          return t
+                              break
+              except Exception:
+                  pass
+              return f"v-{u}-{int(time.time())}"
+
+          def build_unified_release_playlist(tag, u_dir, current_mp4_name, current_thumb_name, current_events):
+              playlist = []
+              try:
+                  vr = subprocess.run(["gh", "release", "view", tag, "--json", "assets"], capture_output=True, text=True, timeout=25)
+                  assets = (json.loads(vr.stdout).get("assets") or []) if vr.returncode == 0 else []
+                  mp4_names = sorted(list({a["name"] for a in assets if a.get("name", "").endswith(".mp4")} | {current_mp4_name}))
+                  if len(mp4_names) <= 1:
+                      return None
+                  max_ev_per_part = max(4000, 16000 // len(mp4_names))
+                  pl_dir = os.path.join(u_dir, "pl_tmp")
+                  shutil.rmtree(pl_dir, ignore_errors=True)
+                  os.makedirs(pl_dir, exist_ok=True)
+                  for idx, mname in enumerate(mp4_names):
+                      bname = mname[:-4]
+                      v_url = f"https://github.com/{REPO}/releases/download/{tag}/{mname}"
+                      t_name = bname + "_thumbs.jpg"
+                      has_t = (mname == current_mp4_name and os.path.exists(os.path.join(u_dir, current_thumb_name))) or any(a.get("name") == t_name for a in assets)
+                      t_url = f"https://github.com/{REPO}/releases/download/{tag}/{t_name}" if has_t else ""
+                      if mname == current_mp4_name:
+                          evs = compact_events(current_events)
+                      else:
+                          j_name = bname + ".json"
+                          subprocess.run(["gh", "release", "download", tag, "-p", j_name, "-D", pl_dir, "--clobber"], check=False, timeout=60)
+                          jp = os.path.join(pl_dir, j_name)
+                          evs = compact_events(load_and_merge_events(jp, None, None)) if os.path.exists(jp) else []
+                      if len(evs) > max_ev_per_part:
+                          step = max(1, len(evs) // max_ev_per_part)
+                          evs = [e for i, e in enumerate(evs) if e.get("type") != "chat" or i % step == 0]
+                      playlist.append({"part": idx + 1, "video_url": v_url, "thumb_url": t_url, "events": evs})
+                  shutil.rmtree(pl_dir, ignore_errors=True)
+                  return playlist
+              except Exception:
+                  return None
 
           def ensure_release(tag, title_str, notes_str):
               vr = subprocess.run(["gh", "release", "view", tag], capture_output=True, text=True, timeout=30)
@@ -1447,7 +1556,7 @@ jobs:
 
               generate_sprite_sheet(mp4_path, thumb_path)
 
-              tag = session_tags.get(u) or f"v-{u}-{int(time.time())}"
+              tag = get_or_reuse_session_tag(u, max_age_sec=10800)
               events = load_and_merge_events(json_path, srt_path, ass_path)
 
               mp4_name = os.path.basename(mp4_path)
@@ -1457,8 +1566,12 @@ jobs:
 
               build_html(video_url, events, part_html_path, thumb_url)
               local_mp4_sz = os.path.getsize(mp4_path)
-              update_main_player = local_mp4_sz >= st.get("max_part_size", 0)
-              if update_main_player:
+              playlist_data = build_unified_release_playlist(tag, u_dir, mp4_name, thumb_name, events)
+              update_main_player = True
+              if playlist_data and len(playlist_data) > 1:
+                  p0 = playlist_data[0]
+                  build_html(p0["video_url"], p0["events"], html_path, p0["thumb_url"], playlist=playlist_data)
+              else:
                   build_html(video_url, events, html_path, thumb_url)
               write_ass(events, ass_path)
 
